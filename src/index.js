@@ -262,16 +262,21 @@ async function main() {
           const timeout = (args.timeout || 180) * 1000;
           const songs = await suno.waitForSongs(args.ids, timeout);
 
-          // Build response with markdown audio embeds for rendering
+          // Build response with markdown audio links for Parachute rendering
+          // Parachute intercepts links ending in .mp3 and renders an audio player
           const songsWithEmbed = songs.map(s => ({
             ...s,
-            markdown: `![${s.title || 'Song'}](${s.audioUrl})`
+            // Use CDN URL for stable MP3 link
+            mp3Url: `https://cdn1.suno.ai/${s.id}.mp3`,
+            markdown: `[${s.title || 'Song'}](https://cdn1.suno.ai/${s.id}.mp3)`
           }));
 
-          // Create a nice display with audio embeds
-          const audioEmbeds = songs.map(s =>
-            `![${s.title || 'Song ' + s.id.substring(0, 8)}](${s.audioUrl})`
-          ).join('\n\n');
+          // Create markdown with both audio link and direct URL
+          const audioEmbeds = songs.map(s => {
+            const title = s.title || 'Song ' + s.id.substring(0, 8);
+            const mp3Url = `https://cdn1.suno.ai/${s.id}.mp3`;
+            return `**${title}**\n[Play Audio](${mp3Url})\nSuno: ${s.sunoUrl}`;
+          }).join('\n\n');
 
           return {
             content: [
@@ -296,13 +301,15 @@ async function main() {
 
           const songs = clips.slice(0, 10).map(c => {
             const clip = c.clip || c;
+            const mp3Url = `https://cdn1.suno.ai/${clip.id}.mp3`;
             return {
               id: clip.id,
               title: clip.title,
               audioUrl: clip.audio_url,
+              mp3Url: mp3Url,
               sunoUrl: `https://suno.com/song/${clip.id}`,
               createdAt: clip.created_at,
-              markdown: `![${clip.title || 'Song'}](${clip.audio_url})`
+              markdown: `[${clip.title || 'Song'}](${mp3Url})`
             };
           });
 
