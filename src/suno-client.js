@@ -8,7 +8,9 @@
 const WebSocket = require('ws');
 
 const SUNO_BASE = 'https://studio-api.prod.suno.com';
-const CDP_URL = 'http://127.0.0.1:9000';
+const CDP_HOST = process.env.CDP_HOST || '0.250.250.254';
+const CDP_PORT = process.env.CDP_PORT || '9100';
+const CDP_URL = `http://${CDP_HOST}:${CDP_PORT}`;
 
 class SunoClient {
   constructor() {
@@ -17,10 +19,24 @@ class SunoClient {
   }
 
   /**
+   * Fetch from CDP endpoint
+   */
+  async cdpFetch(path) {
+    return fetch(`${CDP_URL}${path}`);
+  }
+
+  /**
+   * Connect to a CDP WebSocket target
+   */
+  connectWs(pageTarget) {
+    return new WebSocket(pageTarget.webSocketDebuggerUrl);
+  }
+
+  /**
    * Get a CDP connection to the Suno page
    */
   async getSunoPage() {
-    const response = await fetch(`${CDP_URL}/json/list`);
+    const response = await this.cdpFetch('/json/list');
     const targets = await response.json();
 
     let pageTarget = targets.find(t =>
@@ -34,7 +50,7 @@ class SunoClient {
       pageTarget = targets.find(t => t.type === 'page' && !t.parentId);
       if (pageTarget) {
         // Navigate to Suno
-        const ws = new WebSocket(pageTarget.webSocketDebuggerUrl);
+        const ws = this.connectWs(pageTarget);
         await new Promise((resolve, reject) => {
           ws.on('open', () => {
             ws.send(JSON.stringify({
@@ -69,7 +85,7 @@ class SunoClient {
    * Get auth token from the __session cookie
    */
   async getTokenFromCookies() {
-    const response = await fetch(`${CDP_URL}/json/list`);
+    const response = await this.cdpFetch('/json/list');
     const targets = await response.json();
 
     const pageTarget = targets.find(t => t.type === 'page' && !t.parentId);
@@ -77,7 +93,7 @@ class SunoClient {
       throw new Error('No browser pages available');
     }
 
-    const ws = new WebSocket(pageTarget.webSocketDebuggerUrl);
+    const ws = this.connectWs(pageTarget);
 
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -115,7 +131,7 @@ class SunoClient {
    * Reload Suno page to refresh the auth token
    */
   async reloadSunoPage() {
-    const response = await fetch(`${CDP_URL}/json/list`);
+    const response = await this.cdpFetch('/json/list');
     const targets = await response.json();
 
     let pageTarget = targets.find(t =>
@@ -134,7 +150,7 @@ class SunoClient {
     }
 
     console.error('Connecting to page:', pageTarget.url);
-    const ws = new WebSocket(pageTarget.webSocketDebuggerUrl);
+    const ws = this.connectWs(pageTarget);
 
     return new Promise((resolve, reject) => {
       let msgId = 0;
@@ -326,7 +342,7 @@ class SunoClient {
    */
   async generateSong({ lyrics, style, title, instrumental = false, model = 'chirp-v4' }) {
     const pageTarget = await this.getSunoPage();
-    const ws = new WebSocket(pageTarget.webSocketDebuggerUrl);
+    const ws = this.connectWs(pageTarget);
 
     return new Promise((resolve, reject) => {
       let msgId = 0;
@@ -369,42 +385,49 @@ class SunoClient {
             expression: `
               (async function() {
                 try {
-                  const textareas = Array.from(document.querySelectorAll('textarea'));
-
-                  // Find lyrics textarea
-                  const lyricsArea = textareas.find(t =>
-                    t.placeholder?.toLowerCase().includes('lyric') ||
-                    t.placeholder?.toLowerCase().includes('write')
-                  ) || textareas[0];
-
-                  // Find style textarea
-                  const styleArea = textareas.find(t =>
-                    t.placeholder?.toLowerCase().includes('style') ||
-                    t.placeholder?.toLowerCase().includes('genre') ||
-                    t.placeholder?.toLowerCase().includes('synth') ||
-                    t.placeholder?.toLowerCase().includes('raï')
-                  ) || textareas[1];
-
-                  if (!lyricsArea || !styleArea) {
-                    return JSON.stringify({ success: false, error: 'Could not find form fields' });
+                  // --- Step 1: Ensure Advanced mode ---
+                  const advancedBtn = Array.from(document.querySelectorAll('button')).find(b =>
+                    b.textContent?.trim().toLowerCase() === 'advanced'
+                  );
+                  if (advancedBtn && !advancedBtn.classList.contains('active')) {
+                    advancedBtn.click();
+                    await new Promise(r => setTimeout(r, 800));
                   }
 
-                  // Set lyrics
+                  // --- Step 2: Find lyrics textarea via stable data-testid ---
+                  const lyricsArea = document.querySelector('textarea[data-testid="lyrics-textarea"]')
+                    || Array.from(document.querySelectorAll('textarea')).find(t =>
+                      t.placeholder?.toLowerCase().includes('lyric') ||
+                      t.placeholder?.toLowerCase().includes('write')
+                    );
+                  if (!lyricsArea) {
+                    return JSON.stringify({ success: false, error: 'Could not find lyrics textarea' });
+                  }
+
+                  // --- Step 3: Find style textarea ---
+                  let styleArea = document.querySelector('textarea[maxlength="1000"]:not([data-testid="lyrics-textarea"])');
+                  if (!styleArea) {
+                    const allTextareas = Array.from(document.querySelectorAll('textarea'));
+                    styleArea = allTextareas.find(t => t !== lyricsArea && !t.closest('[style*="display: none"]'));
+                  }
+                  if (!styleArea) {
+                    return JSON.stringify({ success: false, error: 'Could not find style textarea' });
+                  }
+
+                  // --- Step 4: Set lyrics using React-compatible native setter ---
                   const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
                   setter.call(lyricsArea, \`${escapedLyrics}\`);
                   lyricsArea.dispatchEvent(new Event('input', { bubbles: true }));
 
-                  // Set style
+                  // --- Step 5: Set style ---
                   setter.call(styleArea, \`${escapedStyle}\`);
                   styleArea.dispatchEvent(new Event('input', { bubbles: true }));
 
-                  // Set title if provided
+                  // --- Step 6: Set title if provided ---
                   const titleToSet = \`${escapedTitle}\`;
                   if (titleToSet) {
-                    // Find title input by placeholder - it's visible on the page
-                    const titleInput = document.querySelector('input[placeholder*="Title"]');
+                    const titleInput = document.querySelector('input[placeholder*="Song Title"]');
                     if (titleInput) {
-                      // Use native setter like we do for textareas to properly trigger React
                       const inputSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
                       inputSetter.call(titleInput, titleToSet);
                       titleInput.dispatchEvent(new Event('input', { bubbles: true }));
@@ -415,26 +438,22 @@ class SunoClient {
                   // Wait for React to process
                   await new Promise(r => setTimeout(r, 500));
 
-                  // Find and click Create button (may say "Create" or "Create song")
-                  const createBtn = Array.from(document.querySelectorAll('button')).find(b =>
-                    (b.textContent?.toLowerCase().trim() === 'create' ||
-                     b.textContent?.toLowerCase().trim() === 'create song') && !b.disabled
-                  );
-
+                  // --- Step 7: Click Create using stable aria-label ---
+                  let createBtn = document.querySelector('button[aria-label="Create song"]:not([disabled])');
                   if (!createBtn) {
-                    // Button might still be disabled, wait a bit more
                     await new Promise(r => setTimeout(r, 1000));
-                    const retryBtn = Array.from(document.querySelectorAll('button')).find(b =>
-                      (b.textContent?.toLowerCase().trim() === 'create' ||
-                       b.textContent?.toLowerCase().trim() === 'create song') && !b.disabled
-                    );
-                    if (!retryBtn) {
-                      return JSON.stringify({ success: false, error: 'Create button not found or disabled' });
-                    }
-                    retryBtn.click();
-                  } else {
-                    createBtn.click();
+                    createBtn = document.querySelector('button[aria-label="Create song"]:not([disabled])');
                   }
+                  if (!createBtn) {
+                    // Fallback: text content match
+                    createBtn = Array.from(document.querySelectorAll('button')).find(b =>
+                      b.textContent?.toLowerCase().trim().includes('create') && !b.disabled
+                    );
+                  }
+                  if (!createBtn) {
+                    return JSON.stringify({ success: false, error: 'Create button not found or disabled' });
+                  }
+                  createBtn.click();
 
                   return JSON.stringify({ success: true });
                 } catch (err) {
@@ -521,7 +540,7 @@ class SunoClient {
   async generateFromDescription(description, instrumental = false, model = 'chirp-v4') {
     // For description mode, we use the "Simple" tab with just a prompt
     const pageTarget = await this.getSunoPage();
-    const ws = new WebSocket(pageTarget.webSocketDebuggerUrl);
+    const ws = this.connectWs(pageTarget);
 
     return new Promise((resolve, reject) => {
       let msgId = 0;
@@ -555,42 +574,52 @@ class SunoClient {
 
           const escapedDesc = description.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$/g, '\\$');
 
-          // Use the main prompt textarea (first one, for simple mode)
+          // Use Simple mode with a single prompt textarea
           const fillId = send('Runtime.evaluate', {
             expression: `
               (async function() {
                 try {
-                  // Find the main prompt textarea
-                  const textareas = Array.from(document.querySelectorAll('textarea'));
-                  const promptArea = textareas.find(t =>
-                    t.placeholder?.toLowerCase().includes('loud') ||
-                    t.placeholder?.toLowerCase().includes('describe')
-                  ) || textareas[2] || textareas[0];
-
-                  if (!promptArea) {
-                    return JSON.stringify({ success: false, error: 'Could not find prompt field' });
+                  // --- Step 1: Ensure Simple mode ---
+                  const simpleBtn = Array.from(document.querySelectorAll('button')).find(b =>
+                    b.textContent?.trim().toLowerCase() === 'simple'
+                  );
+                  if (simpleBtn && !simpleBtn.classList.contains('active')) {
+                    simpleBtn.click();
+                    await new Promise(r => setTimeout(r, 800));
                   }
 
+                  // --- Step 2: Find the prompt textarea ---
+                  let promptArea = document.querySelector('textarea[data-testid="prompt-textarea"]');
+                  if (!promptArea) {
+                    const textareas = Array.from(document.querySelectorAll('textarea'));
+                    promptArea = textareas[0];
+                  }
+                  if (!promptArea) {
+                    return JSON.stringify({ success: false, error: 'Could not find prompt textarea in Simple mode' });
+                  }
+
+                  // --- Step 3: Set the description ---
                   const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
                   setter.call(promptArea, \`${escapedDesc}\`);
                   promptArea.dispatchEvent(new Event('input', { bubbles: true }));
 
                   await new Promise(r => setTimeout(r, 500));
 
-                  const createBtn = Array.from(document.querySelectorAll('button')).find(b =>
-                    b.textContent?.toLowerCase().trim() === 'create' && !b.disabled
-                  );
-
+                  // --- Step 4: Click Create using stable aria-label ---
+                  let createBtn = document.querySelector('button[aria-label="Create song"]:not([disabled])');
                   if (!createBtn) {
                     await new Promise(r => setTimeout(r, 1000));
-                    const retryBtn = Array.from(document.querySelectorAll('button')).find(b =>
-                      b.textContent?.toLowerCase().trim() === 'create' && !b.disabled
-                    );
-                    if (retryBtn) retryBtn.click();
-                    else return JSON.stringify({ success: false, error: 'Create button not available' });
-                  } else {
-                    createBtn.click();
+                    createBtn = document.querySelector('button[aria-label="Create song"]:not([disabled])');
                   }
+                  if (!createBtn) {
+                    createBtn = Array.from(document.querySelectorAll('button')).find(b =>
+                      b.textContent?.toLowerCase().trim().includes('create') && !b.disabled
+                    );
+                  }
+                  if (!createBtn) {
+                    return JSON.stringify({ success: false, error: 'Create button not found or disabled' });
+                  }
+                  createBtn.click();
 
                   return JSON.stringify({ success: true });
                 } catch (err) {
