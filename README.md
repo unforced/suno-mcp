@@ -13,7 +13,7 @@ An MCP (Model Context Protocol) server for generating music with [Suno](https://
 ## Requirements
 
 - Node.js 18+
-- [BrowserOS](https://browseros.dev) running on port 9000 with an active Suno session
+- [BrowserOS](https://browseros.dev) (or any Chromium with `--remote-debugging-port`) on `http://localhost:9100` with Suno logged in. Override with `CDP_URL`.
 - A Suno account (free or paid)
 
 ## Installation
@@ -50,17 +50,34 @@ Add to your `.mcp.json`:
 ## How It Works
 
 ### Authentication
-Suno uses Clerk for auth with short-lived JWT tokens (~1 hour). The client:
-1. Checks the `__session` cookie from BrowserOS via Chrome DevTools Protocol (CDP)
-2. If expired, reloads the Suno page to trigger a token refresh
-3. Captures the fresh token from network requests
+Suno uses Clerk for auth with short-lived JWT tokens. The client calls
+`window.Clerk.session.getToken()` in the live Suno tab via CDP — Clerk handles
+refresh under the hood, so no page reload is needed. The token is cached until
+5 minutes before its `exp` claim.
 
 ### Song Generation
-Direct API calls fail due to hCaptcha. Instead, we:
-1. Connect to the Suno page via CDP
-2. Inject JavaScript to fill the form (lyrics, style)
-3. Click the Create button (CAPTCHA runs invisibly in browser context)
-4. Capture song IDs from the network response
+Direct API calls fail due to hCaptcha. Rather than scrape form selectors, the
+client drives Suno's own React app:
+
+1. Connect to the Suno tab via CDP; navigate to `/create` if needed.
+2. Walk the React fiber tree from the Create button to find the component that
+   exposes `onCreateClick` / `lyrics` / `styles` / `mode` as props — the semantic
+   generate handler.
+3. Populate lyrics + style textareas using the React-compatible native setter
+   so internal state updates.
+4. Wait until the fiber's props reflect the new values (i.e. React has
+   re-rendered).
+5. Dispatch a trusted mouse click via CDP `Input.dispatchMouseEvent` at the
+   button's coordinates. hCaptcha accepts CDP-synthesized events as real user
+   gestures (calling `onCreateClick()` from JS does not — captcha refuses).
+6. Capture the `/api/generate/v2` response via CDP `Network` events to return
+   the new clip IDs. Falls back to polling `/api/project/default` if the
+   network event is missed.
+
+This approach is robust to UI redesigns: it depends on semantic React props
+(`onCreateClick`, `lyrics`, `styles`) and the `aria-label="Create song"` button
+— both of which are load-bearing and unlikely to change — rather than on
+class names, textContent matches, or DOM layout.
 
 ## Example
 
@@ -85,9 +102,14 @@ await suno_download_song({
 
 ## Known Limitations
 
-- Title field doesn't work reliably (Suno UI limitation)
-- Requires BrowserOS with an active Suno session
-- Token expires every ~1 hour (auto-refreshes)
+- Title field doesn't work reliably (Suno UI limitation — not currently wired
+  through the new generate path).
+- `generate_from_description` (simple mode) currently falls back to custom mode
+  if the UI mode toggle isn't found; pass lyrics + style via `generate_song`
+  for deterministic behaviour.
+- Requires BrowserOS with an active, visible Suno session. The Create button
+  must have non-zero size on screen for the trusted click to land.
+- Token expires every ~1 hour (auto-refreshes via Clerk).
 
 ## License
 
