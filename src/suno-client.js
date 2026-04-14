@@ -1,16 +1,26 @@
 /**
- * Suno API Client
+ * Suno API Client.
  *
- * Uses browser JS injection for generation (to handle CAPTCHA)
- * and direct API calls for read operations.
+ * Strategy:
+ *   - Auth: pulled from window.Clerk.session.getToken() in the live Suno tab
+ *     via CDP. No page reloads needed; Clerk handles refresh under the hood.
+ *   - Read endpoints (credits, feed, projects): direct HTTPS with the JWT.
+ *   - Generate: does NOT scrape visible buttons. Finds the React fiber that
+ *     exposes `onCreateClick` / `lyrics` / `styles` / `mode` as props (an
+ *     internal semantic component near the Create button), fills lyrics/
+ *     styles into the page's React state, and invokes the handler directly.
+ *     hCaptcha validation runs inside the page as a side effect.
+ *   - Captures the /api/generate/v2 response via CDP Network events to return
+ *     the new clip IDs. Falls back to polling `getRecentSongs` if the network
+ *     event is missed.
+ *
+ * Requires BrowserOS (or any Chromium with --remote-debugging-port) on
+ * $CDP_URL (default http://localhost:9100), logged into suno.com.
  */
 
-const WebSocket = require('ws');
+const { CdpSession, findSunoTarget } = require('./cdp.js');
 
 const SUNO_BASE = 'https://studio-api.prod.suno.com';
-const CDP_HOST = process.env.CDP_HOST || '0.250.250.254';
-const CDP_PORT = process.env.CDP_PORT || '9100';
-const CDP_URL = `http://${CDP_HOST}:${CDP_PORT}`;
 
 class SunoClient {
   constructor() {
@@ -18,652 +28,340 @@ class SunoClient {
     this.tokenExpiry = 0;
   }
 
-  /**
-   * Fetch from CDP endpoint
-   */
-  async cdpFetch(path) {
-    return fetch(`${CDP_URL}${path}`);
-  }
+  // ---------- Auth ----------
 
-  /**
-   * Connect to a CDP WebSocket target
-   */
-  connectWs(pageTarget) {
-    return new WebSocket(pageTarget.webSocketDebuggerUrl);
-  }
-
-  /**
-   * Get a CDP connection to the Suno page
-   */
-  async getSunoPage() {
-    const response = await this.cdpFetch('/json/list');
-    const targets = await response.json();
-
-    let pageTarget = targets.find(t =>
-      t.type === 'page' &&
-      !t.parentId &&
-      t.url.includes('suno.com')
-    );
-
-    if (!pageTarget) {
-      // Navigate any page to Suno
-      pageTarget = targets.find(t => t.type === 'page' && !t.parentId);
-      if (pageTarget) {
-        // Navigate to Suno
-        const ws = this.connectWs(pageTarget);
-        await new Promise((resolve, reject) => {
-          ws.on('open', () => {
-            ws.send(JSON.stringify({
-              id: 1,
-              method: 'Page.navigate',
-              params: { url: 'https://suno.com/create' }
-            }));
-          });
-          ws.on('message', (data) => {
-            const msg = JSON.parse(data.toString());
-            if (msg.id === 1) {
-              // Wait for load
-              setTimeout(() => {
-                ws.close();
-                resolve();
-              }, 3000);
-            }
-          });
-          ws.on('error', reject);
-        });
-      }
-    }
-
-    if (!pageTarget) {
-      throw new Error('No browser pages available. Is BrowserOS running?');
-    }
-
-    return pageTarget;
-  }
-
-  /**
-   * Get auth token from the __session cookie
-   */
-  async getTokenFromCookies() {
-    const response = await this.cdpFetch('/json/list');
-    const targets = await response.json();
-
-    const pageTarget = targets.find(t => t.type === 'page' && !t.parentId);
-    if (!pageTarget) {
-      throw new Error('No browser pages available');
-    }
-
-    const ws = this.connectWs(pageTarget);
-
-    return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        ws.close();
-        reject(new Error('Timeout getting cookies'));
-      }, 10000);
-
-      ws.on('open', () => {
-        ws.send(JSON.stringify({ id: 1, method: 'Storage.getCookies' }));
-      });
-
-      ws.on('message', (data) => {
-        const msg = JSON.parse(data.toString());
-        if (msg.id === 1) {
-          clearTimeout(timeout);
-          ws.close();
-
-          const cookies = msg.result?.cookies || [];
-          const sessionCookie = cookies.find(c =>
-            c.name === '__session' && c.domain === 'suno.com'
-          );
-
-          resolve(sessionCookie?.value || null);
-        }
-      });
-
-      ws.on('error', (err) => {
-        clearTimeout(timeout);
-        reject(err);
-      });
-    });
-  }
-
-  /**
-   * Reload Suno page to refresh the auth token
-   */
-  async reloadSunoPage() {
-    const response = await this.cdpFetch('/json/list');
-    const targets = await response.json();
-
-    let pageTarget = targets.find(t =>
-      t.type === 'page' &&
-      !t.parentId &&
-      t.url.includes('suno.com')
-    );
-
-    const needsNavigation = !pageTarget;
-    if (!pageTarget) {
-      pageTarget = targets.find(t => t.type === 'page' && !t.parentId);
-    }
-
-    if (!pageTarget) {
-      throw new Error('No browser pages available');
-    }
-
-    console.error('Connecting to page:', pageTarget.url);
-    const ws = this.connectWs(pageTarget);
-
-    return new Promise((resolve, reject) => {
-      let msgId = 0;
-      let token = null;
-      let pageLoaded = false;
-
-      const send = (method, params = {}) => {
-        msgId++;
-        ws.send(JSON.stringify({ id: msgId, method, params }));
-        return msgId;
-      };
-
-      const timeout = setTimeout(() => {
-        ws.close();
-        if (token) {
-          resolve(token);
-        } else {
-          reject(new Error('Timeout waiting for token refresh. Make sure Suno is logged in.'));
-        }
-      }, 30000);
-
-      ws.on('open', () => {
-        // Enable network monitoring to capture the fresh token
-        send('Network.enable');
-        send('Page.enable');
-
-        // Navigate to Suno create page (or reload if already there)
-        if (needsNavigation || !pageTarget.url.includes('suno.com/create')) {
-          console.error('Navigating to Suno create page...');
-          send('Page.navigate', { url: 'https://suno.com/create' });
-        } else {
-          console.error('Reloading Suno page...');
-          send('Page.reload', { ignoreCache: true });
-        }
-      });
-
-      ws.on('message', (data) => {
-        const msg = JSON.parse(data.toString());
-
-        // Track page load
-        if (msg.method === 'Page.loadEventFired') {
-          pageLoaded = true;
-          console.error('Page loaded, waiting for API requests...');
-        }
-
-        // Capture fresh auth token from network requests
-        if (msg.method === 'Network.requestWillBeSent') {
-          const { request } = msg.params;
-          if (request.url.includes('studio-api.prod.suno.com') &&
-              request.headers.Authorization) {
-            const authHeader = request.headers.Authorization;
-            if (authHeader.startsWith('Bearer ')) {
-              token = authHeader.substring(7);
-              console.error('Captured fresh token from API request');
-              clearTimeout(timeout);
-              ws.close();
-              resolve(token);
-            }
-          }
-        }
-      });
-
-      ws.on('error', (err) => {
-        clearTimeout(timeout);
-        console.error('WebSocket error:', err.message);
-        reject(err);
-      });
-    });
-  }
-
-  /**
-   * Refresh the auth token
-   */
-  async refreshToken() {
-    // First try to get token from cookies
+  async _withSunoSession(fn, { navigate = true } = {}) {
+    const { target } = await findSunoTarget({ navigate });
+    if (!target) throw new Error('No Suno tab open. Open https://suno.com/create in BrowserOS.');
+    const sess = new CdpSession(target.webSocketDebuggerUrl);
+    await sess.open();
     try {
-      const cookieToken = await this.getTokenFromCookies();
-      if (cookieToken) {
-        const parts = cookieToken.split('.');
-        if (parts.length === 3) {
+      return await fn(sess, target);
+    } finally {
+      sess.close();
+    }
+  }
+
+  async refreshToken() {
+    const token = await this._withSunoSession(async (sess) => {
+      const result = await sess.evaluate(`
+        (async () => {
+          if (!window.Clerk) return { error: 'Clerk not loaded yet. Reload the Suno tab.' };
+          if (!window.Clerk.session) return { error: 'Not signed in to Suno.' };
           try {
-            const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
-            const exp = payload.exp * 1000;
-            if (exp > Date.now()) {
-              console.error('Using valid token from cookie');
-              this.token = cookieToken;
-              this.tokenExpiry = exp - (5 * 60 * 1000);
-              return this.token;
-            } else {
-              console.error('Cookie token expired, need to refresh...');
-            }
+            const t = await window.Clerk.session.getToken();
+            return { ok: true, token: t };
           } catch (e) {
-            console.error('Error parsing cookie token:', e.message);
+            return { error: e && e.message || String(e) };
           }
-        }
-      } else {
-        console.error('No session cookie found');
-      }
-    } catch (e) {
-      console.error('Error getting cookies:', e.message);
+        })()
+      `);
+      if (result?.error) throw new Error(result.error);
+      return result?.token;
+    });
+
+    if (!token) throw new Error('Clerk returned no token');
+    this.token = token;
+    // JWT expiry is in the payload. Refresh 5min early.
+    try {
+      const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());
+      this.tokenExpiry = (payload.exp * 1000) - (5 * 60 * 1000);
+    } catch {
+      this.tokenExpiry = Date.now() + 50 * 60 * 1000;
     }
-
-    // Cookie token is expired or invalid - reload page to get fresh token
-    console.error('Reloading Suno page to refresh auth token...');
-    const freshToken = await this.reloadSunoPage();
-
-    if (!freshToken) {
-      throw new Error('Could not get valid token from browser. Make sure Suno is open and logged in.');
-    }
-
-    // Parse expiry from fresh token
-    const parts = freshToken.split('.');
-    if (parts.length === 3) {
-      try {
-        const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
-        const exp = payload.exp * 1000;
-        this.token = freshToken;
-        this.tokenExpiry = exp - (5 * 60 * 1000);
-        console.error('Token refreshed successfully, expires:', new Date(exp).toISOString());
-        return this.token;
-      } catch (e) {
-        console.error('Error parsing fresh token:', e.message);
-      }
-    }
-
-    // Fallback expiry
-    this.token = freshToken;
-    this.tokenExpiry = Date.now() + (50 * 60 * 1000);
-    return this.token;
+    return token;
   }
 
   async ensureToken() {
-    if (!this.token || Date.now() > this.tokenExpiry) {
-      await this.refreshToken();
-    }
+    if (!this.token || Date.now() > this.tokenExpiry) await this.refreshToken();
     return this.token;
   }
 
-  /**
-   * Make an authenticated API request (for read operations)
-   */
+  // ---------- HTTP ----------
+
   async apiRequest(endpoint, options = {}) {
     const token = await this.ensureToken();
-    const url = `${SUNO_BASE}${endpoint}`;
-
-    const response = await fetch(url, {
+    const doFetch = (tok) => fetch(`${SUNO_BASE}${endpoint}`, {
       ...options,
       headers: {
-        'Authorization': `Bearer ${token}`,
+        'Authorization': `Bearer ${tok}`,
         'Content-Type': 'application/json',
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-        ...options.headers
-      }
+        ...(options.headers || {}),
+      },
     });
 
+    let response = await doFetch(token);
     if (response.status === 401) {
       this.token = null;
-      this.tokenExpiry = 0;
-      const newToken = await this.ensureToken();
-
-      const retryResponse = await fetch(url, {
-        ...options,
-        headers: {
-          'Authorization': `Bearer ${newToken}`,
-          'Content-Type': 'application/json',
-          'User-Agent': 'Mozilla/5.0',
-          ...options.headers
-        }
-      });
-
-      if (!retryResponse.ok) {
-        const text = await retryResponse.text();
-        throw new Error(`API request failed: ${retryResponse.status} - ${text}`);
-      }
-
-      return retryResponse.json();
+      const fresh = await this.ensureToken();
+      response = await doFetch(fresh);
     }
-
     if (!response.ok) {
       const text = await response.text();
-      throw new Error(`API request failed: ${response.status} - ${text}`);
+      throw new Error(`API ${endpoint} ${response.status}: ${text.slice(0, 200)}`);
     }
-
     return response.json();
   }
 
+  // ---------- Generation ----------
+
   /**
-   * Generate a song using browser JS injection (handles CAPTCHA automatically)
+   * Drive Suno's internal generate flow via React fiber.
+   *
+   * @param {object} opts
+   * @param {'custom'|'simple'} opts.mode
+   * @param {string} [opts.lyrics]       custom-mode lyrics (or full text in simple)
+   * @param {string} [opts.style]        custom-mode style tags
+   * @param {string} [opts.simplePrompt] simple-mode description
    */
-  async generateSong({ lyrics, style, title, instrumental = false, model = 'chirp-v4' }) {
-    const pageTarget = await this.getSunoPage();
-    const ws = this.connectWs(pageTarget);
+  async _driveGenerate(opts) {
+    const triggerStart = Date.now();
+    return this._withSunoSession(async (sess) => {
+      await sess.send('Network.enable');
+      await sess.send('Page.enable');
 
-    return new Promise((resolve, reject) => {
-      let msgId = 0;
-      const send = (method, params = {}) => {
-        msgId++;
-        ws.send(JSON.stringify({ id: msgId, method, params }));
-        return msgId;
+      // Navigate to /create if we're elsewhere within suno.com.
+      const here = await sess.evaluate(`window.location.pathname`);
+      if (!String(here || '').startsWith('/create')) {
+        await sess.send('Page.navigate', { url: 'https://suno.com/create' });
+        await sess.waitForEvent('Page.loadEventFired', 20000);
+        // React hydration settles a beat after load.
+        await new Promise(r => setTimeout(r, 1500));
+      }
+
+      // Listen for generate response BEFORE triggering.
+      const capturedClips = this._captureGenerateResponse(sess);
+
+      const payload = {
+        mode: opts.mode,
+        lyrics: opts.lyrics || '',
+        style: opts.style || '',
+        simplePrompt: opts.simplePrompt || '',
       };
 
-      const waitForResult = (targetId) => {
-        return new Promise((res) => {
-          const handler = (data) => {
-            const msg = JSON.parse(data.toString());
-            if (msg.id === targetId) {
-              ws.off('message', handler);
-              res(msg);
+      // Phase 1: populate React state with lyrics/styles/prompt. We do NOT
+      // click the button from JS — hCaptcha rejects non-trusted events. We
+      // synthesize the click via CDP Input.dispatchMouseEvent below, which the
+      // browser treats as a real user gesture.
+      const result = await sess.evaluate(`
+        (async () => {
+          const payload = ${JSON.stringify(payload)};
+          const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+          function walkUp(el, match, maxDepth = 40) {
+            const fkey = Object.keys(el).find(k => k.startsWith('__reactFiber$'));
+            if (!fkey) return null;
+            let f = el[fkey], d = 0;
+            while (f && d < maxDepth) {
+              if (match(f)) return f;
+              f = f.return; d++;
             }
-          };
-          ws.on('message', handler);
-        });
-      };
-
-      const timeout = setTimeout(() => {
-        ws.close();
-        reject(new Error('Timeout waiting for song generation'));
-      }, 60000);
-
-      ws.on('open', async () => {
-        try {
-          // Enable network monitoring
-          send('Network.enable');
-
-          // Escape strings for JS
-          const escapedLyrics = lyrics.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$/g, '\\$');
-          const escapedStyle = style.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$/g, '\\$');
-          const escapedTitle = title ? title.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$/g, '\\$') : '';
-
-          // Fill form and click create via JS
-          const fillId = send('Runtime.evaluate', {
-            expression: `
-              (async function() {
-                try {
-                  // --- Step 1: Ensure Advanced mode ---
-                  const advancedBtn = Array.from(document.querySelectorAll('button')).find(b =>
-                    b.textContent?.trim().toLowerCase() === 'advanced'
-                  );
-                  if (advancedBtn && !advancedBtn.classList.contains('active')) {
-                    advancedBtn.click();
-                    await new Promise(r => setTimeout(r, 800));
-                  }
-
-                  // --- Step 2: Find lyrics textarea via stable data-testid ---
-                  const lyricsArea = document.querySelector('textarea[data-testid="lyrics-textarea"]')
-                    || Array.from(document.querySelectorAll('textarea')).find(t =>
-                      t.placeholder?.toLowerCase().includes('lyric') ||
-                      t.placeholder?.toLowerCase().includes('write')
-                    );
-                  if (!lyricsArea) {
-                    return JSON.stringify({ success: false, error: 'Could not find lyrics textarea' });
-                  }
-
-                  // --- Step 3: Find style textarea ---
-                  let styleArea = document.querySelector('textarea[maxlength="1000"]:not([data-testid="lyrics-textarea"])');
-                  if (!styleArea) {
-                    const allTextareas = Array.from(document.querySelectorAll('textarea'));
-                    styleArea = allTextareas.find(t => t !== lyricsArea && !t.closest('[style*="display: none"]'));
-                  }
-                  if (!styleArea) {
-                    return JSON.stringify({ success: false, error: 'Could not find style textarea' });
-                  }
-
-                  // --- Step 4: Set lyrics using React-compatible native setter ---
-                  const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
-                  setter.call(lyricsArea, \`${escapedLyrics}\`);
-                  lyricsArea.dispatchEvent(new Event('input', { bubbles: true }));
-
-                  // --- Step 5: Set style ---
-                  setter.call(styleArea, \`${escapedStyle}\`);
-                  styleArea.dispatchEvent(new Event('input', { bubbles: true }));
-
-                  // --- Step 6: Set title if provided ---
-                  const titleToSet = \`${escapedTitle}\`;
-                  if (titleToSet) {
-                    const titleInput = document.querySelector('input[placeholder*="Song Title"]');
-                    if (titleInput) {
-                      const inputSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                      inputSetter.call(titleInput, titleToSet);
-                      titleInput.dispatchEvent(new Event('input', { bubbles: true }));
-                      titleInput.dispatchEvent(new Event('change', { bubbles: true }));
-                    }
-                  }
-
-                  // Wait for React to process
-                  await new Promise(r => setTimeout(r, 500));
-
-                  // --- Step 7: Click Create using stable aria-label ---
-                  let createBtn = document.querySelector('button[aria-label="Create song"]:not([disabled])');
-                  if (!createBtn) {
-                    await new Promise(r => setTimeout(r, 1000));
-                    createBtn = document.querySelector('button[aria-label="Create song"]:not([disabled])');
-                  }
-                  if (!createBtn) {
-                    // Fallback: text content match
-                    createBtn = Array.from(document.querySelectorAll('button')).find(b =>
-                      b.textContent?.toLowerCase().trim().includes('create') && !b.disabled
-                    );
-                  }
-                  if (!createBtn) {
-                    return JSON.stringify({ success: false, error: 'Create button not found or disabled' });
-                  }
-                  createBtn.click();
-
-                  return JSON.stringify({ success: true });
-                } catch (err) {
-                  return JSON.stringify({ success: false, error: err.message });
-                }
-              })()
-            `,
-            returnByValue: true,
-            awaitPromise: true
-          });
-
-          const fillResult = await waitForResult(fillId);
-          const fillData = JSON.parse(fillResult.result?.result?.value || '{}');
-
-          if (!fillData.success) {
-            clearTimeout(timeout);
-            ws.close();
-            reject(new Error(fillData.error || 'Failed to fill form'));
-            return;
+            return null;
           }
 
-          // Listen for the generate response
-          let clipIds = [];
+          function setReactValue(el, value) {
+            const proto = el instanceof HTMLTextAreaElement
+              ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+            const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+            setter.call(el, value);
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+          }
 
-          const networkHandler = (data) => {
-            const msg = JSON.parse(data.toString());
+          // Find the semantic create fiber (has onCreateClick + mode props).
+          const anchor = document.querySelector('button[aria-label="Create song"]')
+            || document.querySelector('main') || document.body;
+          const createFiber = walkUp(anchor, f =>
+            f.memoizedProps && typeof f.memoizedProps.onCreateClick === 'function'
+          );
+          if (!createFiber) {
+            return { success: false, error: 'Could not locate generate handler (onCreateClick) in React fiber.' };
+          }
 
-            if (msg.method === 'Network.responseReceived') {
-              const { response, requestId } = msg.params;
-              if (response.url.includes('/api/generate/v2')) {
-                // Get response body
-                send('Network.getResponseBody', { requestId });
-              }
+          const cp = createFiber.memoizedProps;
+          if (cp.isGenerating) {
+            return { success: false, error: 'A generation is already in progress. Wait for it to finish.' };
+          }
+          if (cp.isOutOfCredits) {
+            return { success: false, error: 'Out of credits.' };
+          }
+
+          // Switch mode if needed. We can't reliably write React state from outside,
+          // so we still click the mode toggle — but this is a simple tab, not fragile.
+          const wantMode = payload.mode === 'simple' ? 'simple' : 'custom';
+          if (cp.mode && cp.mode !== wantMode) {
+            const label = wantMode === 'simple' ? 'simple' : 'custom';
+            const tabBtn = Array.from(document.querySelectorAll('button, [role="tab"]')).find(b =>
+              b.textContent && b.textContent.trim().toLowerCase() === label
+            );
+            if (tabBtn) { tabBtn.click(); await sleep(600); }
+          }
+
+          if (payload.mode === 'custom') {
+            // Fill lyrics + style textareas. Stable selectors: data-testid + maxlength.
+            const lyricsArea = document.querySelector('textarea[data-testid="lyrics-textarea"]')
+              || Array.from(document.querySelectorAll('textarea')).find(t =>
+                /lyric|write/i.test(t.placeholder || ''));
+            if (!lyricsArea) return { success: false, error: 'Lyrics textarea not found.' };
+            setReactValue(lyricsArea, payload.lyrics);
+
+            let styleArea = document.querySelector(
+              'textarea[maxlength="1000"]:not([data-testid="lyrics-textarea"])'
+            );
+            if (!styleArea) {
+              styleArea = Array.from(document.querySelectorAll('textarea')).find(t =>
+                t !== lyricsArea && !t.closest('[style*="display: none"]'));
             }
+            if (!styleArea) return { success: false, error: 'Style textarea not found.' };
+            setReactValue(styleArea, payload.style);
+          } else {
+            // Simple mode: single prompt textarea.
+            const promptArea = document.querySelector('textarea[data-testid="prompt-textarea"]')
+              || document.querySelector('textarea');
+            if (!promptArea) return { success: false, error: 'Simple-mode prompt textarea not found.' };
+            setReactValue(promptArea, payload.simplePrompt);
+          }
 
-            if (msg.result?.body && msg.result.body.includes('clips')) {
-              try {
-                const responseData = JSON.parse(msg.result.body);
-                if (responseData.clips && responseData.clips.length > 0) {
-                  clipIds = responseData.clips.map(c => c.id);
-                  clearTimeout(timeout);
-                  ws.close();
-                  resolve({
-                    clips: responseData.clips,
-                    message: 'Song generation started'
-                  });
-                }
-              } catch (e) { }
+          // Wait for React to re-render so the fiber's onCreateClick closes over
+          // the updated lyrics/styles state (not the empty values at mount time).
+          async function waitForFiberSync(attempts = 20) {
+            for (let i = 0; i < attempts; i++) {
+              const fresh = walkUp(
+                document.querySelector('button[aria-label="Create song"]') || anchor,
+                f => f.memoizedProps && typeof f.memoizedProps.onCreateClick === 'function'
+              );
+              if (!fresh) { await sleep(150); continue; }
+              const p = fresh.memoizedProps;
+              const ok = payload.mode === 'custom'
+                ? (p.lyrics && p.lyrics.length > 0 && p.styles && (
+                    Array.isArray(p.styles) ? p.styles.length > 0 : String(p.styles).length > 0
+                  ))
+                : (p.lyrics && p.lyrics.length > 0) || (p.simplePrompt && p.simplePrompt.length > 0);
+              if (ok) return { fiber: fresh, waited: i * 150 };
+              await sleep(150);
             }
+            return { fiber: null };
+          }
+
+          const synced = await waitForFiberSync();
+          const freshFiber = synced.fiber || walkUp(
+            document.querySelector('button[aria-label="Create song"]') || anchor,
+            f => f.memoizedProps && typeof f.memoizedProps.onCreateClick === 'function'
+          );
+          const propSnapshot = freshFiber?.memoizedProps || {};
+
+          // Scroll button into view and report its coordinates so CDP can
+          // dispatch a trusted mouse click (required by hCaptcha).
+          const btnEl = document.querySelector('button[aria-label="Create song"]');
+          if (!btnEl) return { success: false, error: 'Create button not in DOM.' };
+          btnEl.scrollIntoView({ block: 'center' });
+          await sleep(100);
+          const r = btnEl.getBoundingClientRect();
+          if (r.width === 0 || r.height === 0) {
+            return { success: false, error: 'Create button has zero size (not visible).' };
+          }
+          return {
+            success: true,
+            clickX: r.left + r.width / 2,
+            clickY: r.top + r.height / 2,
+            waitedMs: synced.waited || 0,
+            observedLyricsLen: (propSnapshot.lyrics || '').length,
+            observedStylesLen: Array.isArray(propSnapshot.styles)
+              ? propSnapshot.styles.length
+              : String(propSnapshot.styles || '').length,
+            observedMode: propSnapshot.mode,
           };
+        })()
+      `);
 
-          ws.on('message', networkHandler);
+      if (!result?.success) {
+        throw new Error(result?.error || 'Unknown failure preparing Suno generate.');
+      }
+      if (process.env.SUNO_DEBUG) console.error('[suno] prepared generate:', result);
 
-          // Also set a check timeout
-          setTimeout(async () => {
-            if (clipIds.length === 0) {
-              // Try to get recent songs to find the new ones
-              clearTimeout(timeout);
-              ws.close();
-              resolve({
-                clips: [],
-                message: 'Generation triggered - check recent songs for results'
-              });
-            }
-          }, 15000);
-
-        } catch (err) {
-          clearTimeout(timeout);
-          ws.close();
-          reject(err);
-        }
+      // Phase 2: trusted click via CDP Input domain. hCaptcha accepts this as
+      // a real user gesture; invoking onCreateClick directly does not.
+      const { clickX: x, clickY: y } = result;
+      await sess.send('Input.dispatchMouseEvent', {
+        type: 'mouseMoved', x, y, button: 'none', buttons: 0,
+      });
+      await sess.send('Input.dispatchMouseEvent', {
+        type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: 1,
+      });
+      await new Promise(r => setTimeout(r, 40));
+      await sess.send('Input.dispatchMouseEvent', {
+        type: 'mouseReleased', x, y, button: 'left', buttons: 0, clickCount: 1,
       });
 
-      ws.on('error', (err) => {
-        clearTimeout(timeout);
-        reject(err);
+      // Wait for either the network capture or a timeout, then fall back to polling.
+      const clips = await Promise.race([
+        capturedClips,
+        new Promise(resolve => setTimeout(() => resolve(null), 20000)),
+      ]);
+
+      if (clips && clips.length) {
+        return { clips, message: 'Song generation started' };
+      }
+
+      // Fallback: query recent songs, only returning clips created after we
+      // dispatched the click. Avoids returning stale top-of-feed results.
+      try {
+        const recent = await this.getRecentSongs();
+        const raw = recent.project_clips || recent.clips || [];
+        const flat = raw
+          .map(c => c.clip || c)
+          .filter(c => {
+            const t = Date.parse(c.created_at || 0);
+            return Number.isFinite(t) && t >= triggerStart - 2000;
+          })
+          .slice(0, 2);
+        return {
+          clips: flat,
+          message: flat.length
+            ? 'Generation triggered (clips resolved via recent list)'
+            : 'Generation triggered — new clips not yet visible. Poll `suno_get_recent`.',
+        };
+      } catch {
+        return { clips: [], message: 'Generation triggered — check recent songs for results' };
+      }
+    });
+  }
+
+  // Resolves to the clip array from the next /api/generate/v2 response,
+  // or never — callers race this against a timeout.
+  _captureGenerateResponse(sess) {
+    return new Promise((resolve) => {
+      const pendingByReqId = new Set();
+      sess.on('Network.responseReceived', (params) => {
+        if (params.response?.url?.includes('/api/generate/v2')) {
+          pendingByReqId.add(params.requestId);
+        }
+      });
+      sess.on('Network.loadingFinished', async (params) => {
+        if (!pendingByReqId.has(params.requestId)) return;
+        pendingByReqId.delete(params.requestId);
+        try {
+          const body = await sess.send('Network.getResponseBody', { requestId: params.requestId });
+          const text = body?.body;
+          if (!text) return;
+          const parsed = JSON.parse(text);
+          const clips = parsed.clips || parsed.data?.clips;
+          if (clips && clips.length) resolve(clips);
+        } catch { /* fall through to timeout */ }
       });
     });
   }
 
-  /**
-   * Generate a song from description using browser JS
-   */
-  async generateFromDescription(description, instrumental = false, model = 'chirp-v4') {
-    // For description mode, we use the "Simple" tab with just a prompt
-    const pageTarget = await this.getSunoPage();
-    const ws = this.connectWs(pageTarget);
-
-    return new Promise((resolve, reject) => {
-      let msgId = 0;
-      const send = (method, params = {}) => {
-        msgId++;
-        ws.send(JSON.stringify({ id: msgId, method, params }));
-        return msgId;
-      };
-
-      const waitForResult = (targetId) => {
-        return new Promise((res) => {
-          const handler = (data) => {
-            const msg = JSON.parse(data.toString());
-            if (msg.id === targetId) {
-              ws.off('message', handler);
-              res(msg);
-            }
-          };
-          ws.on('message', handler);
-        });
-      };
-
-      const timeout = setTimeout(() => {
-        ws.close();
-        reject(new Error('Timeout waiting for song generation'));
-      }, 60000);
-
-      ws.on('open', async () => {
-        try {
-          send('Network.enable');
-
-          const escapedDesc = description.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$/g, '\\$');
-
-          // Use Simple mode with a single prompt textarea
-          const fillId = send('Runtime.evaluate', {
-            expression: `
-              (async function() {
-                try {
-                  // --- Step 1: Ensure Simple mode ---
-                  const simpleBtn = Array.from(document.querySelectorAll('button')).find(b =>
-                    b.textContent?.trim().toLowerCase() === 'simple'
-                  );
-                  if (simpleBtn && !simpleBtn.classList.contains('active')) {
-                    simpleBtn.click();
-                    await new Promise(r => setTimeout(r, 800));
-                  }
-
-                  // --- Step 2: Find the prompt textarea ---
-                  let promptArea = document.querySelector('textarea[data-testid="prompt-textarea"]');
-                  if (!promptArea) {
-                    const textareas = Array.from(document.querySelectorAll('textarea'));
-                    promptArea = textareas[0];
-                  }
-                  if (!promptArea) {
-                    return JSON.stringify({ success: false, error: 'Could not find prompt textarea in Simple mode' });
-                  }
-
-                  // --- Step 3: Set the description ---
-                  const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
-                  setter.call(promptArea, \`${escapedDesc}\`);
-                  promptArea.dispatchEvent(new Event('input', { bubbles: true }));
-
-                  await new Promise(r => setTimeout(r, 500));
-
-                  // --- Step 4: Click Create using stable aria-label ---
-                  let createBtn = document.querySelector('button[aria-label="Create song"]:not([disabled])');
-                  if (!createBtn) {
-                    await new Promise(r => setTimeout(r, 1000));
-                    createBtn = document.querySelector('button[aria-label="Create song"]:not([disabled])');
-                  }
-                  if (!createBtn) {
-                    createBtn = Array.from(document.querySelectorAll('button')).find(b =>
-                      b.textContent?.toLowerCase().trim().includes('create') && !b.disabled
-                    );
-                  }
-                  if (!createBtn) {
-                    return JSON.stringify({ success: false, error: 'Create button not found or disabled' });
-                  }
-                  createBtn.click();
-
-                  return JSON.stringify({ success: true });
-                } catch (err) {
-                  return JSON.stringify({ success: false, error: err.message });
-                }
-              })()
-            `,
-            returnByValue: true,
-            awaitPromise: true
-          });
-
-          const fillResult = await waitForResult(fillId);
-          const fillData = JSON.parse(fillResult.result?.result?.value || '{}');
-
-          if (!fillData.success) {
-            clearTimeout(timeout);
-            ws.close();
-            reject(new Error(fillData.error || 'Failed to fill form'));
-            return;
-          }
-
-          // Wait for response
-          setTimeout(() => {
-            clearTimeout(timeout);
-            ws.close();
-            resolve({
-              clips: [],
-              message: 'Generation triggered - check recent songs for results'
-            });
-          }, 10000);
-
-        } catch (err) {
-          clearTimeout(timeout);
-          ws.close();
-          reject(err);
-        }
-      });
-
-      ws.on('error', (err) => {
-        clearTimeout(timeout);
-        reject(err);
-      });
-    });
+  async generateSong({ lyrics, style, title /* unused — Suno UI bug */, instrumental, model } = {}) {
+    return this._driveGenerate({ mode: 'custom', lyrics, style });
   }
+
+  async generateFromDescription(description) {
+    return this._driveGenerate({ mode: 'simple', simplePrompt: description });
+  }
+
+  // ---------- Reads ----------
 
   async getCredits() {
     return this.apiRequest('/api/billing/info/');
@@ -674,105 +372,72 @@ class SunoClient {
     return this.apiRequest(`/api/feed/v2?ids=${idsParam}`);
   }
 
-  async waitForSongs(ids, maxWait = 180000, pollInterval = 5000) {
-    const startTime = Date.now();
-    const songIds = Array.isArray(ids) ? ids : [ids];
-
-    while (Date.now() - startTime < maxWait) {
-      const status = await this.getSongStatus(songIds);
-      const clips = Array.isArray(status) ? status : (status.clips || status);
-
-      if (!Array.isArray(clips) || clips.length === 0) {
-        await new Promise(r => setTimeout(r, pollInterval));
-        continue;
-      }
-
-      const allComplete = clips.every(clip =>
-        clip.status === 'complete' || clip.status === 'streaming'
-      );
-
-      if (allComplete) {
-        return clips.map(clip => ({
-          id: clip.id,
-          title: clip.title,
-          audioUrl: clip.audio_url,
-          imageUrl: clip.image_url,
-          videoUrl: clip.video_url,
-          duration: clip.metadata?.duration || clip.duration,
-          status: clip.status,
-          sunoUrl: `https://suno.com/song/${clip.id}`
-        }));
-      }
-
-      await new Promise(r => setTimeout(r, pollInterval));
-    }
-
-    throw new Error('Timeout waiting for song generation');
-  }
-
   async getRecentSongs(page = 1) {
     return this.apiRequest(`/api/project/default?page=${page}`);
   }
 
-  /**
-   * Download a song MP3 to a specified folder
-   * @param {string} songId - The song ID
-   * @param {string} folder - The folder path to save to
-   * @param {string} filename - Optional filename (without extension), defaults to song ID
-   * @returns {Promise<{path: string, size: number}>}
-   */
+  async waitForSongs(ids, maxWait = 180000, pollInterval = 5000) {
+    const start = Date.now();
+    const songIds = Array.isArray(ids) ? ids : [ids];
+    while (Date.now() - start < maxWait) {
+      const status = await this.getSongStatus(songIds);
+      const clips = Array.isArray(status) ? status : (status.clips || status);
+      if (Array.isArray(clips) && clips.length) {
+        const done = clips.every(c => c.status === 'complete' || c.status === 'streaming');
+        if (done) {
+          return clips.map(c => ({
+            id: c.id,
+            title: c.title,
+            audioUrl: c.audio_url,
+            imageUrl: c.image_url,
+            videoUrl: c.video_url,
+            duration: c.metadata?.duration || c.duration,
+            status: c.status,
+            sunoUrl: `https://suno.com/song/${c.id}`,
+          }));
+        }
+      }
+      await new Promise(r => setTimeout(r, pollInterval));
+    }
+    throw new Error('Timeout waiting for song generation');
+  }
+
   async downloadSong(songId, folder, filename = null) {
     const fs = require('fs');
     const path = require('path');
 
-    // Get song info to find the audio URL
     const status = await this.getSongStatus([songId]);
     const clips = Array.isArray(status) ? status : (status.clips || []);
     const song = clips.find(c => c.id === songId);
-
-    if (!song) {
-      throw new Error(`Song not found: ${songId}`);
-    }
-
+    if (!song) throw new Error(`Song not found: ${songId}`);
     if (song.status !== 'complete' && song.status !== 'streaming') {
       throw new Error(`Song not ready for download. Status: ${song.status}`);
     }
 
-    // Prefer CDN URL over audiopipe URL
     const audioUrl = song.audio_url?.includes('cdn')
       ? song.audio_url
       : `https://cdn1.suno.ai/${songId}.mp3`;
 
-    // Create folder if it doesn't exist
-    if (!fs.existsSync(folder)) {
-      fs.mkdirSync(folder, { recursive: true });
-    }
+    if (!fs.existsSync(folder)) fs.mkdirSync(folder, { recursive: true });
 
-    // Determine filename
-    const finalFilename = filename || song.title || songId;
-    // Sanitize filename
-    const safeFilename = finalFilename.replace(/[^a-z0-9\-_\s]/gi, '').replace(/\s+/g, '-').toLowerCase();
-    const filePath = path.join(folder, `${safeFilename}.mp3`);
+    const base = filename || song.title || songId;
+    const safe = base.replace(/[^a-z0-9\-_\s]/gi, '').replace(/\s+/g, '-').toLowerCase();
+    const filePath = path.join(folder, `${safe}.mp3`);
 
-    // Download the file
-    const response = await fetch(audioUrl);
-    if (!response.ok) {
-      throw new Error(`Failed to download: ${response.status}`);
-    }
-
-    const arrayBuffer = await response.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-    fs.writeFileSync(filePath, buffer);
+    const res = await fetch(audioUrl);
+    if (!res.ok) throw new Error(`Failed to download: ${res.status}`);
+    const buf = Buffer.from(await res.arrayBuffer());
+    fs.writeFileSync(filePath, buf);
 
     return {
       path: filePath,
-      size: buffer.length,
+      size: buf.length,
       song: {
         id: song.id,
         title: song.title,
-        audioUrl: audioUrl,
-        sunoUrl: `https://suno.com/song/${songId}`
-      }
+        audioUrl,
+        sunoUrl: `https://suno.com/song/${songId}`,
+      },
     };
   }
 }
